@@ -86,7 +86,7 @@ def quick_start(model, dataset, config_dict, save_model=True, mg=False):
 def main():
     parser = argparse.ArgumentParser(description='FMCNS: Flow Matching with Causal-aware Negative Sampling for Multimodal Recommendation')
     parser.add_argument('-m', '--model', type=str, default='FMCNS', help='Model name')
-    parser.add_argument('-d', '--dataset', type=str, default='sports', help='Dataset name')
+    parser.add_argument('-d', '--dataset', type=str, default='baby', help='Dataset name')
     parser.add_argument('--save_model', action='store_true', default=True, help='Whether to save the model')
     parser.add_argument('--mg', action='store_true', default=False, help='Multi-GPU training')
     

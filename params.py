@@ -94,17 +94,17 @@ class Config(object):
                 'knn_k': 10,
                 'mm_image_weight': 0.1,
                 'dropout': 0.8,
-                'flow_weight': 0.5,
+                'flow_weight': [0.5, 1, 2],
                 'n_steps': 10,
                 's_steps': 2,
                 'time_embedding_size': 64,
-                'w': [0.4, 0.5, 0.6, 0.7],
+                'w': 0.5,
                 'weight': 0.8,
                 'sample_k': 0.1,
                 'intervention_beta': 3.0,
                 'causal_reg_weight': 0.1,
                 'causal_balance_factor': 0.5,
-                'hyper_parameters': ["w"]
+                'hyper_parameters': ["flow_weight"]
             }
             file_config_dict.update(model_config)
         

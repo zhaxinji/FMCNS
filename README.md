@@ -10,10 +10,6 @@ We propose a novel Flow Matching with Causal-aware Negative Sampling framework (
 
 Extensive experiments conducted on three publicly available datasets (Baby, Sports, and Clothing) demonstrate that our proposed FMCNS framework outperforms several state-of-the-art multimodal recommendation baselines across multiple evaluation metrics.
 
-<p>
-<img src="./images/model.jpg" >
-</p>
-
 ## Environment Requirement
 
 * python == 3.12.6
