@@ -62,6 +62,3 @@ The released code consists of the following files.
 --logger.py
 --utils.py
 ```
-
-## Acknowledgement
-The structure of this code is inspired by the [MMRec](https://github.com/enoche/MMRec) framework. We acknowledge and appreciate their valuable contributions.
