@@ -5,16 +5,9 @@ import scipy.sparse as sp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.nn.init import xavier_normal_, xavier_uniform_, constant_
 import math
-import copy
-import importlib
-import itertools
-from time import time
-from logging import getLogger
-from utils import get_local_time, early_stopping, dict2str, TopKEvaluator, build_sim, compute_normalized_laplacian
+from utils import build_sim, compute_normalized_laplacian
 
 def xavier_normal_initialization(module):
     if isinstance(module, nn.Embedding):
@@ -371,6 +364,7 @@ class FMCNS(GeneralRecommender):
         self.dropout = config['dropout']
         self.degree_ratio = config['degree_ratio']
         self.aug_weight = config['aug_weight']
+        self.prior_type = config['prior_type']
         
         self.epoch_idx = 0
 
@@ -432,12 +426,63 @@ class FMCNS(GeneralRecommender):
         self.freq_mean = self.item_frequencies.mean()
         self.freq_std = self.item_frequencies.std()
 
+        self.n_strata = config['n_strata'] if 'n_strata' in config else 4
+        self.causal_eps = 1e-8
+        self._setup_causal_strata()
+
+    def _setup_causal_strata(self):
+        K = self.n_strata
+        freqs = self.item_frequencies.detach()
+
+        quantile_levels = torch.linspace(0.0, 1.0, K + 1, device=freqs.device)
+        boundaries = torch.quantile(freqs, quantile_levels)
+
+        inner_boundaries = boundaries[1:-1].contiguous()
+        if inner_boundaries.numel() == 0:
+            item_strata = torch.zeros_like(freqs, dtype=torch.long)
+        else:
+            item_strata = torch.bucketize(freqs.contiguous(), inner_boundaries)
+            item_strata = torch.clamp(item_strata, 0, K - 1)
+
+        stratum_means = torch.zeros(K, device=freqs.device)
+        for k in range(K):
+            mask = (item_strata == k)
+            if mask.sum() > 0:
+                stratum_means[k] = freqs[mask].mean()
+            else:
+                stratum_means[k] = freqs.mean()
+
+        f_max = stratum_means.max()
+        omega_k = 1.0 - stratum_means / (f_max + self.causal_eps)
+
+        self.item_strata = item_strata.to(self.device)
+        self.omega_k = omega_k.to(self.device)
+        self.item_omega = self.omega_k[self.item_strata]
+
     def get_item_frequencies(self):
         item_counts = torch.zeros(self.n_items, device=self.device)
         for row, col in zip(self.interaction_matrix.row, self.interaction_matrix.col):
             item_counts[col] += 1
         item_frequencies = item_counts / self.n_users
         return item_frequencies
+
+    def get_prior(self, items=None):
+        if items is not None:
+            shape = (items.shape[0], self.embedding_dim)
+        else:
+            shape = (self.n_items, self.embedding_dim)
+        
+        if self.prior_type == 'random_binary':
+            return torch.bernoulli(torch.full(shape, 0.5, device=self.device))
+        elif self.prior_type == 'uniform':
+            return (torch.rand(shape, device=self.device) >= 0.5).float()
+        elif self.prior_type == 'gaussian':
+            return (torch.sigmoid(torch.randn(shape, device=self.device)) >= 0.5).float()
+        else:
+            if items is not None:
+                return torch.bernoulli(self.item_frequencies[items].unsqueeze(-1).expand(-1, self.embedding_dim)).to(self.device)
+            else:
+                return torch.bernoulli(self.item_frequencies.unsqueeze(-1).expand(-1, self.embedding_dim)).to(self.device)
 
     def get_knn_adj_mat(self, mm_embeddings):
         context_norm = mm_embeddings.div(torch.norm(mm_embeddings, p=2, dim=-1, keepdim=True))
@@ -565,7 +610,7 @@ class FMCNS(GeneralRecommender):
         flow_v = image_feats[items, :]
         flow_t = text_feats[items, :]
         
-        x0 = torch.bernoulli(self.item_frequencies[items].unsqueeze(-1).expand(-1, self.embedding_dim)).to(items.device)
+        x0 = self.get_prior(items)
         
         flow_loss, predicted_x = self.flow_matching.p_losses(flow_items, flow_t, flow_v, t_batch, x0)
         
@@ -602,7 +647,7 @@ class FMCNS(GeneralRecommender):
         if self.v_feat is not None:
             image_feats = self.image_trs(self.image_embedding.weight)
 
-        x0 = torch.bernoulli(self.item_frequencies.unsqueeze(-1).expand(-1, self.embedding_dim)).to(self.device)
+        x0 = self.get_prior()
         
         predicted_x = self.flow_matching.sample(
             x0, text_feats, image_feats, self.item_frequencies
@@ -610,221 +655,28 @@ class FMCNS(GeneralRecommender):
         self.sample_x = predicted_x
 
     def sample_neg_items(self, pos_items, users, ia_embeddings):
-        freq_bias = self.item_frequencies[pos_items].unsqueeze(-1)
-        causal_mask = torch.sigmoid(-self.intervention_beta * (freq_bias - self.freq_mean) / (self.freq_std + 1e-8))
-        
+        omega = self.item_omega[pos_items].unsqueeze(-1)
+        omega = torch.clamp(self.intervention_beta * omega, max=1.0)
+
         flow_enhanced_emb = self.sample_x[pos_items] if self.sample_x is not None else ia_embeddings[pos_items]
-        debiased_embeddings = causal_mask * flow_enhanced_emb + (1 - causal_mask) * ia_embeddings[pos_items]
-        
+        debiased_embeddings = omega * flow_enhanced_emb + (1.0 - omega) * ia_embeddings[pos_items]
+
         num_candidates = min(int(0.15 * ia_embeddings.shape[0]), 1000)
         candidate_idx = torch.randperm(ia_embeddings.shape[0], device=self.device)[:num_candidates]
         candidate_embs = ia_embeddings[candidate_idx]
-        
+
         similarity_matrix = torch.matmul(debiased_embeddings, candidate_embs.t())
-        
+
         user_history = self.interaction_matrix_dense[users.cpu()][:, candidate_idx.cpu()].to(self.device)
         masked_similarity = similarity_matrix.masked_fill(user_history.bool(), float('-inf'))
-        
+
         k = max(1, int(self.sample_k * num_candidates))
         _, top_k_idx = torch.topk(masked_similarity, k=k, dim=1)
-        
+
         random_select = torch.randint(0, k, (len(pos_items),), device=self.device)
         final_candidates = top_k_idx[torch.arange(len(pos_items)), random_select]
-        
+
         return candidate_idx[final_candidates]
-
-class AbstractTrainer(object):
-    def __init__(self, config, model):
-        self.config = config
-        self.model = model
-
-    def fit(self, train_data):
-        raise NotImplementedError('Method [next] should be implemented.')
-
-    def evaluate(self, eval_data):
-        raise NotImplementedError('Method [next] should be implemented.')
-
-class Trainer(AbstractTrainer):
-    def __init__(self, config, model, mg=False):
-        super(Trainer, self).__init__(config, model)
-        self.logger = getLogger()
-        self.learner = config['learner']
-        self.learning_rate = config['learning_rate']
-        self.epochs = config['epochs']
-        self.eval_step = min(config['eval_step'], self.epochs)
-        self.stopping_step = config['stopping_step']
-        self.clip_grad_norm = config['clip_grad_norm']
-        self.valid_metric = config['valid_metric'].lower()
-        self.valid_metric_bigger = config['valid_metric_bigger']
-        self.test_batch_size = config['eval_batch_size']
-        self.device = config['device']
-        self.flow_lr = config['flow_lr']
-
-        self.start_epoch = 0
-        self.cur_step = 0
-        self.softmax = nn.Softmax(dim=-1)
-        tmp_dd = {}
-        for j, k in list(itertools.product(config['metrics'], config['topk'])):
-            tmp_dd[f'{j.lower()}@{k}'] = 0.0
-        self.best_valid_score = -1
-        self.best_valid_result = tmp_dd
-        self.best_test_upon_valid = tmp_dd
-        self.train_loss_dict = dict()
-        self.optimizer = self._build_optimizer()
-
-        lr_scheduler = config['learning_rate_scheduler']
-        fac = lambda epoch: lr_scheduler[0] ** (epoch / lr_scheduler[1])
-        scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=fac)
-        self.lr_scheduler = scheduler
-
-        self.eval_type = config['eval_type']
-        self.evaluator = TopKEvaluator(config)
-
-        self.item_tensor = None
-        self.tot_item_num = None
-        
-        self.mg = mg
-        self.alpha1 = config['alpha1']
-        self.alpha2 = config['alpha2']
-        self.beta = config['beta']
-
-    def _build_optimizer(self):
-        if self.learner.lower() == 'adam':
-            optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        elif self.learner.lower() == 'sgd':
-            optimizer = optim.SGD(self.model.parameters(), lr=self.learning_rate)
-        elif self.learner.lower() == 'adagrad':
-            optimizer = optim.Adagrad(self.model.parameters(), lr=self.learning_rate)
-        elif self.learner.lower() == 'rmsprop':
-            optimizer = optim.RMSprop(self.model.parameters(), lr=self.learning_rate)
-        else:
-            self.logger.warning('Received unrecognized optimizer, set default Adam optimizer')
-            optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        return optimizer
-
-    def _train_epoch(self, train_data, epoch_idx, loss_func=None):
-        self.model.train()
-        loss_func = loss_func or self.model.calculate_loss
-        total_loss = None
-        loss_batches = []
-        for batch_idx, interaction in enumerate(train_data):
-            self.optimizer.zero_grad()
-            second_inter = interaction.clone()
-            losses = loss_func(interaction)
-            if isinstance(losses, tuple):
-                loss = sum(losses)
-                loss_tuple = tuple(per_loss.item() for per_loss in losses)
-                total_loss = loss_tuple if total_loss is None else tuple(map(sum, zip(total_loss, loss_tuple)))
-            else:
-                loss = losses
-                total_loss = losses.item() if total_loss is None else total_loss + losses.item()
-            if self._check_nan(loss):
-                return loss, torch.tensor(0.0)
-            if self.mg and batch_idx % self.beta == 0:
-                first_loss = self.alpha1 * loss
-                first_loss.backward()
-
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                
-                losses = loss_func(second_inter)
-                if isinstance(losses, tuple):
-                    loss = sum(losses)
-                else:
-                    loss = losses
-                    
-                if self._check_nan(loss):
-                    return loss, torch.tensor(0.0)
-                second_loss = -1 * self.alpha2 * loss
-                second_loss.backward()
-            else:
-                loss.backward()
-            
-            if self.clip_grad_norm:
-                clip_grad_norm_(self.model.parameters(), **self.clip_grad_norm)
-            self.optimizer.step()
-            loss_batches.append(loss.detach())
-            
-        return total_loss, loss_batches
-
-    def _valid_epoch(self, valid_data, is_test=False):
-        valid_result = self.evaluate(valid_data, is_test)
-        valid_score = valid_result[self.valid_metric] if self.valid_metric else valid_result['NDCG@20']
-        return valid_score, valid_result
-
-    def _check_nan(self, loss):
-        if torch.isnan(loss):
-            return True
-
-    def _generate_train_loss_output(self, epoch_idx, s_time, e_time, losses):
-        train_loss_output = 'epoch %d training [time: %.2fs, ' % (epoch_idx, e_time - s_time)
-        if isinstance(losses, tuple):
-            train_loss_output = ', '.join('train_loss%d: %.4f' % (idx + 1, loss) for idx, loss in enumerate(losses))
-        else:
-            train_loss_output += 'train loss: %.4f' % losses
-        return train_loss_output + ']'
-
-    def fit(self, train_data, valid_data=None, test_data=None, saved=False, verbose=True):
-        for epoch_idx in range(self.start_epoch, self.epochs):
-            training_start_time = time()
-            self.model.pre_epoch_processing(epoch_idx)
-            train_loss, _ = self._train_epoch(train_data, epoch_idx)
-            
-            if torch.is_tensor(train_loss):
-                break
-            self.lr_scheduler.step()
-
-            self.train_loss_dict[epoch_idx] = sum(train_loss) if isinstance(train_loss, tuple) else train_loss
-            training_end_time = time()
-            
-            post_info = self.model.post_epoch_processing()
-
-            if (epoch_idx + 1) % self.eval_step == 0:
-                self.model.sample()
-                valid_start_time = time()
-                valid_score, valid_result = self._valid_epoch(valid_data, is_test=False)
-                self.best_valid_score, self.cur_step, stop_flag, update_flag = early_stopping(
-                    valid_score, self.best_valid_score, self.cur_step,
-                    max_step=self.stopping_step, bigger=self.valid_metric_bigger)
-                valid_end_time = time()
-                
-                _, test_result = self._valid_epoch(test_data, is_test=True)
-                
-                if verbose:
-                    log_str = f"Epoch {epoch_idx+1}/{self.epochs}, "
-                    metrics_str = []
-                    for metric in ['recall', 'ndcg']:
-                        for k in [10, 20]:
-                            key = f'{metric}@{k}'
-                            if key in test_result:
-                                metrics_str.append(f"{key}: {test_result[key]:.4f}")
-                    log_str += ", ".join(metrics_str)
-                    self.logger.info(log_str)
-                    self.logger.info("")
-                    
-                if update_flag:
-                    self.best_valid_result = valid_result
-                    self.best_test_upon_valid = test_result
-
-                if stop_flag:
-                    if verbose:
-                        self.logger.info(f'Training stopped at epoch {epoch_idx + 1}')
-                    break
-        return self.best_valid_score, self.best_valid_result, self.best_test_upon_valid
-
-    @torch.no_grad()
-    def evaluate(self, eval_data, is_test=False, idx=0):
-        self.model.eval()
-        
-        batch_matrix_list = []
-        for batch_idx, batched_data in enumerate(eval_data):
-            scores = self.model.full_sort_predict(batched_data)
-            masked_items = batched_data[1]
-            scores[masked_items[0], masked_items[1]] = -1e10
-            _, topk_index = torch.topk(scores, max(self.config['topk']), dim=-1)
-            batch_matrix_list.append(topk_index)
-            
-        return self.evaluator.evaluate(batch_matrix_list, eval_data, is_test=is_test, idx=idx)
 
 def get_model(model_name):
     if model_name in globals():
